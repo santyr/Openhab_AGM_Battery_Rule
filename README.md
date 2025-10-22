@@ -1,50 +1,85 @@
-# OpenHAB AGM Battery SoC Rule  
-**Fullriver DC400-6 Bank (8S2P, 48 V nominal)**  
+# Battery SoC and Runtime Estimator (Fullriver DC400-6, 8S2P)
 
-This OpenHAB 5.2.x rule calculates and smooths the **State of Charge (SoC)** for an AGM battery bank using a hybrid of **Coulomb counting** and **voltage-based estimation** with dynamic offsets, temperature compensation, Peukert’s law, and tail-current detection.  
-Designed for a dual-string (8S2P) Fullriver DC400-6 bank (~800 Ah @ C20).
+This OpenHAB 5.2+ Rules DSL script calculates accurate battery **State-of-Charge (SoC)**, applies temperature and Peukert corrections, smooths transitions near full charge, and estimates **runtime to 40 % remaining SoC** under current load.
 
 ---
 
-## 📋 Features
-- Voltage-SoC mapping from Fullriver OCV spec  
-- Coulomb counting with Charge Efficiency Factor and Peukert compensation  
-- Adaptive complementary fusion of voltage- and current-based SoC  
-- Automatic recalibration during float or at rest  
-- Temperature-compensated OCV and internal resistance  
-- EMA-based OCV stability gating  
-- Smooth ramp-to-100 % when tail-current condition holds  
-- Optional persistence for voltage EMA and tail-current timing  
-- Outputs display SoC to **two decimal places**
+## ⚙️ Overview
+
+**Key features**
+- Voltage- and coulomb-based SoC fusion  
+- Temperature- and current-compensated voltage lookup  
+- Peukert’s law correction for discharge accuracy  
+- Dynamic charge efficiency  
+- Smooth ramp from 99 → 100 % after float tail current  
+- Runtime and remaining Ah estimation (discharge only)  
+
+**Battery**
+- Fullriver DC400-6 AGM (8S × 2P)
+- Nominal 48 V, 830 Ah @ C20
+- Float 54.6 V, Absorption 58.8 V
 
 ---
 
 ## 🧩 Required Items
 
-Create these **Items** in MainUI:
+Create these **Number** or **DateTime** items in **MainUI → Settings → Items → + Add Item**  
+Assign the labels shown below and enable *restoreOnStartup* persistence where noted.
 
-| Item Name | Type | Purpose |
-|------------|------|----------|
-| `DCData_Voltage` | Number:ElectricPotential | Battery voltage input |
-| `DCData_Current` | Number:ElectricCurrent | Charge/discharge current |
-| `ChargerStatus` | String | Charger stage: *Bulk*, *Absorption*, *Float* |
-| `AmbientWeatherWS2902A_WH31E_193_Temperature` | Number:Temperature | Battery or ambient temperature |
-| `BatterySoC_Calculated` | Number | Displayed SoC (%.2f) |
-| `BatterySoC_CoulombCounter` | Number | Internal Coulomb counter |
-
-**Helper Items (no channels):**
-
-| Item Name | Type | Description |
-|------------|------|--------------|
-| `Battery_Voltage_EMA` | Number | Stores smoothed voltage (EMA) |
-| `Battery_Voltage_EMA_Ts` | DateTime | Timestamp of last EMA update |
-| `Battery_TailOk_Since` | DateTime | Tail-current timer reference |
-
-### Recommended Metadata
-For `Battery_Voltage_EMA` → Metadata → *State Description* → `%.2f V`
+| Item Name | Type | Purpose | Persistence |
+|------------|------|----------|--------------|
+| `DCData_Voltage` | Number:ElectricPotential | Pack voltage (V) | — |
+| `DCData_Current` | Number:ElectricCurrent | Charge/discharge current (A) | — |
+| `ChargerStatus` | String | Text from inverter/charger (“Bulk”, “Absorption”, “Float”) | — |
+| `AmbientWeatherWS2902A_WH31E_193_Temperature` | Number:Temperature | Ambient or battery-sensor °C | — |
+| `BatterySoC_Calculated` | Number | Smoothed displayed SoC (%.2f) | yes |
+| `BatterySoC_CoulombCounter` | Number | Raw coulomb-tracked SoC (%) | yes |
+| `Battery_Voltage_EMA` | Number | Exponential moving-average voltage | yes |
+| `Battery_Voltage_EMA_Ts` | DateTime | Timestamp of EMA sample | yes |
+| `Battery_TailOk_Since` | DateTime | Timer for float tail current | yes |
+| `Battery_Remaining_Ah` | Number | Present Ah remaining | yes |
+| `Battery_Runtime_Hours` | Number | Hours to 40 % SoC (@ current load) | yes |
 
 ---
 
-## 💾 Persistence Configuration
+## 🧠 Rule Creation
 
-Install **MapDB** or **JDBC** persistence and enable:
+1. Open **MainUI → Settings → Rules → + Add Rule**  
+2. **Triggers:**  
+   - *When Item DCData_Voltage receives update*  
+   - *or Item DCData_Current receives update*  
+3. **Action:**  
+   - Action Type → *Script* → Language **Rules DSL**  
+   - Paste the entire script (`battery_soc_calc.rules`)  
+4. Save and enable.
+
+---
+
+## 📊 Output Items
+
+- `BatterySoC_Calculated` → Displayed %.2f SoC  
+- `BatterySoC_CoulombCounter` → Underlying integrated SoC  
+- `Battery_Remaining_Ah` → Current energy reserve (Ah)  
+- `Battery_Runtime_Hours` → Estimated hours to 40 % SoC while discharging  
+
+---
+
+## 🔧 Parameters (adjust inside script)
+
+| Variable | Default | Description |
+|-----------|----------|-------------|
+| `TOTAL_CAPACITY_AH` | 830.0 | Bank capacity (Ah) |
+| `PEUKERT_EXPONENT` | 1.15 | AGM Peukert factor |
+| `RUNTIME_DOD_LIMIT_PCT` | 60 | Runtime stops at 40 % SoC |
+| `TAIL_CURRENT_THRESH` | 8.3 A | C/100 tail current |
+| `EMA_ALPHA` | 0.1 | Voltage EMA smoothing |
+| `rampRatePctPerMin` | 0.2 | Ramp speed 99→100 % |
+
+---
+
+## 🧪 Validation
+
+View logs with:
+```bash
+openhab-cli console
+log:tail SoC_AGM_Calc
