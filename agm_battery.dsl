@@ -64,9 +64,8 @@ val long   OCV_MIN_STABLE_MS         = 30L * 60L * 1000L
 val double TAIL_CURRENT_THRESH = TOTAL_CAPACITY_AH / 100.0   // 8.3 A
 val long   TAIL_PERSIST_MS     = 20L * 60L * 1000L
 
-// --- Runtime estimator (to 40% SoC remaining) ---
-val double RUNTIME_DOD_LIMIT_PCT         = 60.0        // stop estimate at 40% SoC remaining
-val double MIN_DISCH_CURRENT_FOR_RUNTIME = 1.0         // A
+// --- Runtime estimator (no SoC floor; Schneider handles alarms) ---
+val double MIN_DISCH_CURRENT_FOR_RUNTIME = 1.0  // A
 
 // --- Time-To-Full (TTF) using Schneider MPPT 60-150 and PV items ---
 val double CONTROLLER_MAX_CHG_A = 60.0   // A
@@ -315,9 +314,8 @@ if (currentCoulombSoC > 100.0) currentCoulombSoC = 100.0
 if (currentCoulombSoC < 0.0)  currentCoulombSoC = 0.0
 if (currentCoulombSoC >= 0.0) postUpdate(BATTERY_SOC_COULOMB_ITEM, currentCoulombSoC)
 
-// --- Runtime estimate to DOD limit (discharging only, to 40% SoC remaining) ---
+// --- Runtime estimate (discharging only, no SoC floor) ---
 val double finalSoC = currentCoulombSoC
-val double reservePct = 100.0 - RUNTIME_DOD_LIMIT_PCT         // 40% remaining
 val double remainingAh = (finalSoC / 100.0) * TOTAL_CAPACITY_AH
 postUpdate(BATTERY_REMAINING_AH_ITEM, String::format("%.1f", remainingAh))
 
@@ -329,8 +327,9 @@ if (current < -MIN_DISCH_CURRENT_FOR_RUNTIME) {
     val double peukertFactor = java.lang.Math.pow(ratio, PEUKERT_EXPONENT - 1.0)
     Ieff = Ieff * peukertFactor
   }
-  val double usablePct = java.lang.Math::max(0.0, finalSoC - reservePct)
-  val double usableAh = (usablePct / 100.0) * TOTAL_CAPACITY_AH
+  // usable percent until 0% SoC
+  val double usablePct = java.lang.Math::max(0.0, finalSoC - 0.0)
+  val double usableAh  = (usablePct / 100.0) * TOTAL_CAPACITY_AH
   val double runtimeHours = if (Ieff > 0) (usableAh / Ieff) else 0.0
   postUpdate(BATTERY_RUNTIME_HOURS_ITEM, String::format("%.2f", runtimeHours))
 } else {
