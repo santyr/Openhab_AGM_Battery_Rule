@@ -1,5 +1,5 @@
 // --- AGM Configuration ---
-val double TOTAL_CAPACITY_AH = 830.0  // Fullriver DC400-6, 8S2P, ~800 Ah @ C20
+val double TOTAL_CAPACITY_AH = 830.0  // Fullriver DC400-6, 8S2P, 415 Ah x2
 
 // --- Voltage-SoC Points (OCV @ 25°C → 48 V pack) ---
 val java.util.List<Double> V_POINTS = new java.util.ArrayList<Double>(java.util.Arrays.asList(
@@ -47,18 +47,22 @@ val double CEF_HIGH_SOC           = 0.92
 
 // --- Peukert ---
 val double PEUKERT_EXPONENT  = 1.15
-val double C20_RATE_CURRENT  = TOTAL_CAPACITY_AH / 20.0  // 40 A
+val double C20_RATE_CURRENT  = TOTAL_CAPACITY_AH / 20.0  // 41.5 A
 val double PEUKERT_MAX_RATIO = 5.0
 
 // --- OCV Window / EMA ---
 val double EMA_ALPHA                 = 0.1
-val double OCV_CURR_THRESH           = TOTAL_CAPACITY_AH / 200.0   // 4 A
+val double OCV_CURR_THRESH           = TOTAL_CAPACITY_AH / 200.0   // 4.15 A
 val double OCV_DVDT_THRESH_V_PER_MIN = 0.005
 val long   OCV_MIN_STABLE_MS         = 30L * 60L * 1000L
 
 // --- Tail Current “True Full” ---
-val double TAIL_CURRENT_THRESH = TOTAL_CAPACITY_AH / 100.0   // 8 A
+val double TAIL_CURRENT_THRESH = TOTAL_CAPACITY_AH / 100.0   // 8.30 A
 val long   TAIL_PERSIST_MS     = 20L * 60L * 1000L
+
+// --- Runtime estimator (DOD limit and minimum discharge current) ---
+val double RUNTIME_DOD_LIMIT_PCT = 60.0          // stop runtime at 40% SoC remaining
+val double MIN_DISCH_CURRENT_FOR_RUNTIME = 1.0   // A
 
 // --- Items ---
 val BATTERY_VOLTAGE_ITEM        = DCData_Voltage
@@ -67,11 +71,11 @@ val CHARGER_STATUS_ITEM         = ChargerStatus
 val BATTERY_TEMPERATURE_ITEM    = AmbientWeatherWS2902A_WH31E_193_Temperature
 val BATTERY_SOC_CALCULATED_ITEM = BatterySoC_Calculated
 val BATTERY_SOC_COULOMB_ITEM    = BatterySoC_CoulombCounter
-
-// Helper Items (must exist; no dynamic lookup)
-val V_EMA_ITEM        = Battery_Voltage_EMA
-val V_EMA_TIME_ITEM   = Battery_Voltage_EMA_Ts
-val TAIL_OK_SINCE_ITEM= Battery_TailOk_Since
+val V_EMA_ITEM                  = Battery_Voltage_EMA
+val V_EMA_TIME_ITEM             = Battery_Voltage_EMA_Ts
+val TAIL_OK_SINCE_ITEM          = Battery_TailOk_Since
+val BATTERY_RUNTIME_HOURS_ITEM  = Battery_Runtime_Hours
+val BATTERY_REMAINING_AH_ITEM   = Battery_Remaining_Ah
 
 // Logs
 val String MAIN_LOG  = "SoC_AGM_Calc"
@@ -248,7 +252,7 @@ if (currentCoulombSoC >= 0.0 && currentCoulombSoC <= 100.0) {
         val double ratioRaw = java.lang.Math::abs(current) / C20_RATE_CURRENT
         val double ratio = java.lang.Math::min(ratioRaw, PEUKERT_MAX_RATIO)
         if (ratio > (20.0/30.0)) { // > ~C/30
-          val double peukertFactor = java.lang.Math.pow(ratio, PEUKERT_EXPONENT - 1.0)
+          val double peukertFactor = java.lang.Math::pow(ratio, PEUKERT_EXPONENT - 1.0)
           effectiveCurrent = current * peukertFactor
         }
       }
@@ -278,8 +282,29 @@ if (currentCoulombSoC > 100.0) currentCoulombSoC = 100.0
 if (currentCoulombSoC < 0.0)  currentCoulombSoC = 0.0
 if (currentCoulombSoC >= 0.0) postUpdate(BATTERY_SOC_COULOMB_ITEM, currentCoulombSoC)
 
+// --- Runtime estimate to DOD limit (discharging only) ---
+val double finalSoC = currentCoulombSoC
+val double reservePct = 100.0 - RUNTIME_DOD_LIMIT_PCT         // 40% SoC remaining
+val double remainingAh = (finalSoC / 100.0) * TOTAL_CAPACITY_AH
+postUpdate(BATTERY_REMAINING_AH_ITEM, String::format("%.1f", remainingAh))
+
+if (current < -MIN_DISCH_CURRENT_FOR_RUNTIME) {
+  var double Ieff = java.lang.Math::abs(current)
+  val double ratioRaw = Ieff / C20_RATE_CURRENT
+  val double ratio = java.lang.Math::min(ratioRaw, PEUKERT_MAX_RATIO)
+  if (ratio > (20.0/30.0)) {
+    val double peukertFactor = java.lang.Math::pow(ratio, PEUKERT_EXPONENT - 1.0)
+    Ieff = Ieff * peukertFactor
+  }
+  val double usablePct = java.lang.Math::max(0.0, finalSoC - reservePct)
+  val double usableAh = (usablePct / 100.0) * TOTAL_CAPACITY_AH
+  val double runtimeHours = if (Ieff > 0) (usableAh / Ieff) else 0.0
+  postUpdate(BATTERY_RUNTIME_HOURS_ITEM, String::format("%.2f", runtimeHours))
+} else {
+  postUpdate(BATTERY_RUNTIME_HOURS_ITEM, UNDEF)
+}
+
 // Smoothed display output to two decimals
-var double finalSoC = currentCoulombSoC
 var double displayPrev = if (BATTERY_SOC_CALCULATED_ITEM.state instanceof Number) (BATTERY_SOC_CALCULATED_ITEM.state as Number).doubleValue else finalSoC
 val double displaySoC = 0.8 * displayPrev + 0.2 * finalSoC
 
@@ -290,7 +315,7 @@ if (finalSoC >= 0.0 && finalSoC <= 100.0) {
       formattedSoC,
       if (voltageBasedSoC == -1.0) "N/A" else String::format("%.1f", voltageBasedSoC),
       String::format("%.1f", currentCoulombSoC),
-      String::format("%.2f", ocvAtNominalTemp), // display adjusted value
+      String::format("%.2f", ocvAtNominalTemp),
       String::format("%.1f", current),
       String::format("%.1f", dVdt_V_per_min * 1000.0),
       String::format("%s", ocvWindow),
