@@ -1,85 +1,70 @@
-# Battery SoC and Runtime Estimator (Fullriver DC400-6, 8S2P)
+# Battery SoC, Runtime, and Time-to-Full (Fullriver DC400-6, 8S2P; Schneider MPPT 60-150)
 
-This OpenHAB 5.2+ Rules DSL script calculates accurate battery **State-of-Charge (SoC)**, applies temperature and Peukert corrections, smooths transitions near full charge, and estimates **runtime to 40 % remaining SoC** under current load.
+OpenHAB 5.2+ Rules DSL script that computes SoC with voltage–coulomb fusion, temperature and Peukert corrections, smooth 99→100 % ramp, **runtime to 40 % SoC**, and **time-to-full (TTF)** while charging.
 
----
-
-## ⚙️ Overview
-
-**Key features**
-- Voltage- and coulomb-based SoC fusion  
-- Temperature- and current-compensated voltage lookup  
-- Peukert’s law correction for discharge accuracy  
-- Dynamic charge efficiency  
-- Smooth ramp from 99 → 100 % after float tail current  
-- Runtime and remaining Ah estimation (discharge only)  
+## Requirements
 
 **Battery**
-- Fullriver DC400-6 AGM (8S × 2P)
-- Nominal 48 V, 830 Ah @ C20
-- Float 54.6 V, Absorption 58.8 V
+- Fullriver DC400-6 AGM, 8S2P, **830 Ah @ C20**.
+- Float 54.6 V, Absorption 58.8 V.
 
----
+**Charge controller**
+- Schneider **MPPT 60-150**. Output limited to **60 A**; DC-DC efficiency assumed **0.97**.
 
-## 🧩 Required Items
+## Items to create
 
-Create these **Number** or **DateTime** items in **MainUI → Settings → Items → + Add Item**  
-Assign the labels shown below and enable *restoreOnStartup* persistence where noted.
+Create these in **MainUI → Settings → Items → + Add Item**. Use the shown types. Enable *restoreOnStartup* on the helpers and outputs.
 
-| Item Name | Type | Purpose | Persistence |
-|------------|------|----------|--------------|
-| `DCData_Voltage` | Number:ElectricPotential | Pack voltage (V) | — |
-| `DCData_Current` | Number:ElectricCurrent | Charge/discharge current (A) | — |
-| `ChargerStatus` | String | Text from inverter/charger (“Bulk”, “Absorption”, “Float”) | — |
-| `AmbientWeatherWS2902A_WH31E_193_Temperature` | Number:Temperature | Ambient or battery-sensor °C | — |
-| `BatterySoC_Calculated` | Number | Smoothed displayed SoC (%.2f) | yes |
+| Item Name | Type | Purpose | Persist |
+|---|---|---|---|
+| `DCData_Voltage` | Number:ElectricPotential | Battery pack voltage (V) | — |
+| `DCData_Current` | Number:ElectricCurrent | Pack current (+A charge, −A discharge) | — |
+| `ChargerStatus` | String | “Bulk”, “Absorption”, “Float” | — |
+| `AmbientWeatherWS2902A_WH31E_193_Temperature` | Number:Temperature | Battery/ambient °C | — |
 | `BatterySoC_CoulombCounter` | Number | Raw coulomb-tracked SoC (%) | yes |
-| `Battery_Voltage_EMA` | Number | Exponential moving-average voltage | yes |
-| `Battery_Voltage_EMA_Ts` | DateTime | Timestamp of EMA sample | yes |
-| `Battery_TailOk_Since` | DateTime | Timer for float tail current | yes |
-| `Battery_Remaining_Ah` | Number | Present Ah remaining | yes |
-| `Battery_Runtime_Hours` | Number | Hours to 40 % SoC (@ current load) | yes |
+| `BatterySoC_Calculated` | Number | Smoothed display SoC (%.2f) | yes |
+| `Battery_Voltage_EMA` | Number | EMA voltage | yes |
+| `Battery_Voltage_EMA_Ts` | DateTime | EMA timestamp | yes |
+| `Battery_TailOk_Since` | DateTime | Tail-current timer | yes |
+| `Battery_Remaining_Ah` | Number | Remaining Ah | yes |
+| `Battery_Runtime_Hours` | Number | Runtime to 40 % SoC (h) | yes |
+| `PV_Current` | Number or Number:ElectricCurrent | PV array current (A or mA) | — |
+| `PV_Power` | Number or Number:Power | PV power (W) | — |
+| `PV_Voltage` | Number or Number:ElectricPotential | PV voltage (V or mV) | — |
+| `Battery_TimeToFull_Hours` | Number | **Time to full** while charging (h) | yes |
 
----
+## State descriptions (UI formatting)
 
-## 🧠 Rule Creation
+Add in **MainUI → Items → [item] → Add metadata → State description**.
 
-1. Open **MainUI → Settings → Rules → + Add Rule**  
-2. **Triggers:**  
-   - *When Item DCData_Voltage receives update*  
-   - *or Item DCData_Current receives update*  
-3. **Action:**  
-   - Action Type → *Script* → Language **Rules DSL**  
-   - Paste the entire script (`battery_soc_calc.rules`)  
-4. Save and enable.
+- `BatterySoC_Calculated` → **Pattern:** `%.2f %%`
+- `Battery_Remaining_Ah` → **Pattern:** `%.1f Ah`
+- `Battery_Runtime_Hours` → **Pattern:** `%.2f h`
+- `Battery_TimeToFull_Hours` → **Pattern:** `%.2f h`
 
----
+> Suggested **state description** for `Battery_TimeToFull_Hours`:  
+> **Pattern:** `%.2f h`  
+> **Options:** leave empty  
+> **Read-only:** unchecked
 
-## 📊 Output Items
+## Rule
 
-- `BatterySoC_Calculated` → Displayed %.2f SoC  
-- `BatterySoC_CoulombCounter` → Underlying integrated SoC  
-- `Battery_Remaining_Ah` → Current energy reserve (Ah)  
-- `Battery_Runtime_Hours` → Estimated hours to 40 % SoC while discharging  
+Create a rule in **MainUI → Settings → Rules → + Add Rule**.
+- **Triggers:** “Item `DCData_Voltage` received update” OR “Item `DCData_Current` received update”.
+- **Action:** Script (Rules DSL). Paste the full script from `battery_soc_calc.rules`.
 
----
+## Tuning knobs (inside script)
 
-## 🔧 Parameters (adjust inside script)
+- `TOTAL_CAPACITY_AH = 830.0`
+- `PEUKERT_EXPONENT = 1.15`
+- `RUNTIME_DOD_LIMIT_PCT = 60.0`  → runtime stops at 40 % SoC
+- `TAIL_CURRENT_THRESH = C/100`
+- `EMA_ALPHA = 0.1`
+- `CONTROLLER_MAX_CHG_A = 60.0`, `CONTROLLER_EFF = 0.97`
+- Ramp rate near full: `rampRatePctPerMin = 0.2`
 
-| Variable | Default | Description |
-|-----------|----------|-------------|
-| `TOTAL_CAPACITY_AH` | 830.0 | Bank capacity (Ah) |
-| `PEUKERT_EXPONENT` | 1.15 | AGM Peukert factor |
-| `RUNTIME_DOD_LIMIT_PCT` | 60 | Runtime stops at 40 % SoC |
-| `TAIL_CURRENT_THRESH` | 8.3 A | C/100 tail current |
-| `EMA_ALPHA` | 0.1 | Voltage EMA smoothing |
-| `rampRatePctPerMin` | 0.2 | Ramp speed 99→100 % |
+## Notes
 
----
-
-## 🧪 Validation
-
-View logs with:
-```bash
-openhab-cli console
-log:tail SoC_AGM_Calc
+- TTF is computed only when charging and reports `UNDEF` otherwise.
+- PV current/voltage may arrive in mA/mV; the script auto-scales.
+- Accuracy improves with valid charger status, temperature, and persistent EMA/tail items.
