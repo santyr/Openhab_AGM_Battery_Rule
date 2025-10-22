@@ -28,14 +28,13 @@ val double MAX_DISCHARGE_OFFSET  = 1.5
 val double NOMINAL_TEMPERATURE_C       = 25.0
 val double TEMP_COEFF_OCV_VOLTAGE_PACK = -0.096  // V/°C for 48 V pack
 val double TEMP_COEFF_RESISTANCE       = -0.015
-// Tight operating range
 val double MIN_OPERATING_TEMP_C        = -15.0
 val double MAX_OPERATING_TEMP_C        = 40.0
 
 // --- Current thresholds ---
 val double CHARGE_CURRENT_THRESHOLD              = 0.5
 val double DISCHARGE_CURRENT_THRESHOLD           = -0.5
-val double LOW_CURRENT_THRESHOLD                 = 6.0
+val double LOW_CURRENT_THRESHOLD                 = 4.0
 val double COULOMB_MIN_CURRENT_FOR_DELTA_T_CHECK = 0.5
 
 // --- Recalibration thresholds ---
@@ -76,7 +75,7 @@ val double CONTROLLER_EFF       = 0.97   // DC-DC efficiency estimate
 // --- Items: primary measurements ---
 val BATTERY_VOLTAGE_ITEM        = DCData_Voltage                   // Number:ElectricPotential
 val BATTERY_CURRENT_ITEM        = DCData_Current                   // Number:ElectricCurrent (+A charging, -A discharging)
-val CHARGER_STATUS_ITEM         = ChargerStatus                    // String: "Bulk","Absorption","Float"
+val CHARGER_STATUS_ITEM         = ChargerStatus                    // String: "Bulk","Absorption","Float","Discharging"
 val BATTERY_TEMPERATURE_ITEM    = AmbientWeatherWS2902A_WH31E_193_Temperature // Number:Temperature
 
 // --- SoC outputs ---
@@ -151,7 +150,7 @@ val double ocvAtNominalTemp = v - (currentTemperatureC - NOMINAL_TEMPERATURE_C) 
 // --- EMA + dV/dt for OCV window ---
 val long nowMs = java.time.ZonedDateTime::now().toInstant().toEpochMilli()
 var double vEma  = if (V_EMA_ITEM.state instanceof Number) (V_EMA_ITEM.state as Number).doubleValue else v
-var long   vTsMs = if (V_EMA_TIME_ITEM.state instanceof DateTimeType) (V_EMA_TIME_ITEM.state as DateTimeType).zonedDateTime.toInstant.toEpochMilli else nowMs
+var long   vTsMs = if (V_EMA_TIME_ITEM.state instanceof DateTimeType) (V_EMA_TIME_ITEM.state as DateTimeType).zonedDateTime.toInstant().toEpochMilli else nowMs
 val double dtSec = java.lang.Math::max(1.0, (nowMs - vTsMs) / 1000.0)
 val double vEmaNew = (1.0 - EMA_ALPHA) * vEma + EMA_ALPHA * v
 val double dVdt_V_per_min = ((vEmaNew - vEma) / dtSec) * 60.0
@@ -172,8 +171,10 @@ if (ocvWindow) {
     val double rChg = EFFECTIVE_CHARGE_RESISTANCE_NOMINAL * tR
     val double rDis = EFFECTIVE_DISCHARGE_RESISTANCE_NOMINAL * tR
     val boolean bulkOrAbs = "Bulk".equals(chargeStatusStr) || "Absorption".equals(chargeStatusStr)
-    if (current >= CHARGE_CURRENT_THRESHOLD || bulkOrAbs) {
-      if (current >= CHARGE_CURRENT_THRESHOLD) vLookup = ocvAtNominalTemp - java.lang.Math::min(MAX_CHARGE_OFFSET, java.lang.Math::abs(current) * rChg)
+
+    // Apply charge-offset only in Bulk/Absorption (not Float)
+    if (current >= CHARGE_CURRENT_THRESHOLD && bulkOrAbs) {
+      vLookup = ocvAtNominalTemp - java.lang.Math::min(MAX_CHARGE_OFFSET, java.lang.Math::abs(current) * rChg)
     } else if (current <= DISCHARGE_CURRENT_THRESHOLD) {
       vLookup = ocvAtNominalTemp + java.lang.Math::min(MAX_DISCHARGE_OFFSET, java.lang.Math::abs(current) * rDis)
     }
@@ -199,10 +200,10 @@ if (ocvWindow) {
 // --- Seed Coulomb SoC if invalid ---
 if ((currentCoulombSoC < 0.0 || currentCoulombSoC > 100.0) && voltageBasedSoC >= 0.0) currentCoulombSoC = voltageBasedSoC
 
-// === Smooth full detection and ramp-to-100 ===
+// === Smooth full detection and ramp-to-100 with hard clamp ===
 val boolean inAbsorbOrFloat = "Absorption".equals(chargeStatusStr) || "Float".equals(chargeStatusStr)
 val boolean tailCurrentOk = Iabs <= TAIL_CURRENT_THRESH
-var long tailOkSince = if (TAIL_OK_SINCE_ITEM.state instanceof DateTimeType) (TAIL_OK_SINCE_ITEM.state as DateTimeType).zonedDateTime.toInstant.toEpochMilli else nowMs
+var long tailOkSince = if (TAIL_OK_SINCE_ITEM.state instanceof DateTimeType) (TAIL_OK_SINCE_ITEM.state as DateTimeType).zonedDateTime.toInstant().toEpochMilli else nowMs
 
 if (inAbsorbOrFloat && tailCurrentOk) {
   if (!(TAIL_OK_SINCE_ITEM.state instanceof DateTimeType)) {
@@ -210,8 +211,15 @@ if (inAbsorbOrFloat && tailCurrentOk) {
     tailOkSince = nowMs
   }
   val long tailHeldMs = nowMs - tailOkSince
+
   if (tailHeldMs >= TAIL_PERSIST_MS) {
-    val double minutesBeyond = (tailHeldMs - TAIL_PERSIST_MS) / 60000.0
+    currentCoulombSoC = 100.0
+    postUpdate(BATTERY_SOC_COULOMB_ITEM, 100.0)
+    postUpdate(BATTERY_SOC_CALCULATED_ITEM, "100.00")
+    logInfo(MAIN_LOG, "Tail-current full persisted. Clamped to 100.00%.")
+    return;
+  } else {
+    val double minutesBeyond = java.lang.Math::max(0.0, (tailHeldMs - TAIL_PERSIST_MS) / 60000.0)
     val double rampRatePctPerMin = 0.2
     val double rampStartPct = 99.0
     val double target = java.lang.Math::min(100.0, rampStartPct + minutesBeyond * rampRatePctPerMin)
@@ -276,7 +284,7 @@ if (currentCoulombSoC >= 0.0 && currentCoulombSoC <= 100.0) {
       } else if (current < 0) {
         val double ratioRaw = java.lang.Math::abs(current) / C20_RATE_CURRENT
         val double ratio = java.lang.Math::min(ratioRaw, PEUKERT_MAX_RATIO)
-        if (ratio > (20.0/30.0)) { // > ~C/30
+        if (ratio > (20.0/30.0)) {
           val double peukertFactor = java.lang.Math.pow(ratio, PEUKERT_EXPONENT - 1.0)
           effectiveCurrent = current * peukertFactor
         }
@@ -318,7 +326,7 @@ if (current < -MIN_DISCH_CURRENT_FOR_RUNTIME) {
   val double ratioRaw = Ieff / C20_RATE_CURRENT
   val double ratio = java.lang.Math::min(ratioRaw, PEUKERT_MAX_RATIO)
   if (ratio > (20.0/30.0)) {
-    val double peukertFactor = java.lang.Math::pow(ratio, PEUKERT_EXPONENT - 1.0)
+    val double peukertFactor = java.lang.Math.pow(ratio, PEUKERT_EXPONENT - 1.0)
     Ieff = Ieff * peukertFactor
   }
   val double usablePct = java.lang.Math::max(0.0, finalSoC - reservePct)
@@ -389,7 +397,6 @@ if (Ichg > 0.2 && ("Bulk".equals(chargeStatusStr) || "Absorption".equals(chargeS
     val double targetPct = 99.0
     val double pctRemain = java.lang.Math::max(0.0, targetPct - finalSoC)
     val double ahRemain  = (pctRemain / 100.0) * TOTAL_CAPACITY_AH
-    val double tauH      = 1.2  // heuristic time constant
     val double I0        = java.lang.Math::max(Ichg, TAIL_CURRENT_THRESH)
     val double Iavg      = java.lang.Math::max(TAIL_CURRENT_THRESH, 0.5 * (I0 + TAIL_CURRENT_THRESH))
     val double IeffAbs   = Iavg * CEF_HIGH_SOC
@@ -411,9 +418,16 @@ if (Ichg > 0.2 && ("Bulk".equals(chargeStatusStr) || "Absorption".equals(chargeS
   postUpdate(BATTERY_TTF_HOURS_ITEM, UNDEF)
 }
 
-// --- Smoothed display output to two decimals ---
-var double displayPrev = if (BATTERY_SOC_CALCULATED_ITEM.state instanceof Number) (BATTERY_SOC_CALCULATED_ITEM.state as Number).doubleValue else finalSoC
-val double displaySoC = 0.8 * displayPrev + 0.2 * finalSoC
+// --- Display output (%.2f). Skip smoothing near full to avoid 99.98 stalls ---
+val boolean nearFull = "Float".equals(chargeStatusStr) && finalSoC >= 99.5
+val double displaySoC =
+  if (nearFull) finalSoC
+  else {
+    var double displayPrev = if (BATTERY_SOC_CALCULATED_ITEM.state instanceof Number)
+                               (BATTERY_SOC_CALCULATED_ITEM.state as Number).doubleValue
+                             else finalSoC
+    0.8 * displayPrev + 0.2 * finalSoC
+  }
 
 if (finalSoC >= 0.0 && finalSoC <= 100.0) {
   val String formattedSoC = String::format("%.2f", displaySoC)
