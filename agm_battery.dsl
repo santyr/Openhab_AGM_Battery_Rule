@@ -60,8 +60,8 @@ val double OCV_CURR_THRESH           = TOTAL_CAPACITY_AH / 200.0   // 4.15 A
 val double OCV_DVDT_THRESH_V_PER_MIN = 0.005
 val long   OCV_MIN_STABLE_MS         = 30L * 60L * 1000L
 
-// --- Tail current “true full” detection ---
-val double TAIL_CURRENT_THRESH = TOTAL_CAPACITY_AH / 100.0   // 8.3 A
+// --- Tail current “true full” detection (tuned) ---
+val double TAIL_CURRENT_THRESH = 5.0   // A (was C/100 ≈ 8.3 A)
 val long   TAIL_PERSIST_MS     = 20L * 60L * 1000L
 
 // --- Runtime estimator (no SoC floor; Schneider handles alarms) ---
@@ -219,7 +219,7 @@ if (inAbsorbOrFloat && tailCurrentOk) {
     return;
   } else {
     val double minutesBeyond = java.lang.Math::max(0.0, (tailHeldMs - TAIL_PERSIST_MS) / 60000.0)
-    val double rampRatePctPerMin = 0.2
+    val double rampRatePctPerMin = 0.1   // tuned down from 0.2
     val double rampStartPct = 99.0
     val double target = java.lang.Math::min(100.0, rampStartPct + minutesBeyond * rampRatePctPerMin)
     if (currentCoulombSoC < target) currentCoulombSoC = target
@@ -327,7 +327,6 @@ if (current < -MIN_DISCH_CURRENT_FOR_RUNTIME) {
     val double peukertFactor = java.lang.Math.pow(ratio, PEUKERT_EXPONENT - 1.0)
     Ieff = Ieff * peukertFactor
   }
-  // usable percent until 0% SoC
   val double usablePct = java.lang.Math::max(0.0, finalSoC - 0.0)
   val double usableAh  = (usablePct / 100.0) * TOTAL_CAPACITY_AH
   val double runtimeHours = if (Ieff > 0) (usableAh / Ieff) else 0.0
@@ -403,7 +402,7 @@ if (Ichg > 0.2 && ("Bulk".equals(chargeStatusStr) || "Absorption".equals(chargeS
     if (pctRemain < 0.2) ttfHours = 0.1
 
   } else { // Float
-    val double rampRatePctPerMin = 0.2
+    val double rampRatePctPerMin = 0.1  // tuned down from 0.2
     val double pctRemain = java.lang.Math::max(0.0, 100.0 - finalSoC)
     ttfHours = if (rampRatePctPerMin > 0) pctRemain / (rampRatePctPerMin * 60.0) else -1.0
   }
