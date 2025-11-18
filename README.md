@@ -107,3 +107,14 @@ val Number CONTROLLER_EFF = 0.97       // Efficiency from PV High Voltage -> Bat
 
 // Smoothing
 val Number EMA_ALPHA = 0.1             // Voltage smoothing factor (0.1 = slow, 0.5 = fast)
+
+### How Time-to-Full (TTF) Works
+
+The script calculates how much power the solar array *could* provide versus how much the battery *needs*.
+
+1.  **Input Normalization:** It reads `PV_Voltage` and `PV_Current`. If sensors report in mV/mA, the script detects this and converts to V/A automatically.
+2.  **Power Calculation:** `Raw Solar Power = PV_Volts * PV_Amps`.
+3.  **Efficiency Loss:** Applies `CONTROLLER_EFF` (0.97) to account for MPPT conversion heat loss.
+4.  **Potential Current:** Converts the available Watts into potential charging Amps at the current battery voltage.
+5.  **Hardware Clamping:** If the potential current exceeds the Schneider MPPT limit (`CONTROLLER_MAX_CHG_A` = 60A), the calculation is capped at 60A.
+6.  **Final Estimate:** The script divides the missing Amp-hours (Capacity - Current Ah) by this clamped current to determine hours remaining.
