@@ -9,7 +9,7 @@ val double TAIL_CURRENT_THRESH  = 8.3     // Amps
 val double CHARGED_VOLTAGE      = 54.6    // Float/Absorb voltage trigger
 
 // --- Logic Thresholds ---
-val double RUNTIME_DOD_LIMIT_PCT = 60.0   // 40% SoC is the floor for runtime calc
+val double RUNTIME_DOD_LIMIT_PCT = 60.0   // 60% DoD = 40% SoC floor. (Adjust to 80.0 for 20% floor)
 val double EMA_ALPHA             = 0.1    // Smoothing factor
 
 // --- Solar/Hardware Limits ---
@@ -42,7 +42,6 @@ val ttfItem      = Battery_TimeToFull_Hours
 val integTsItem  = Battery_Integration_TS 
 
 // 1. Get Valid Sensor Readings (Safety Check)
-// We explicitly cast to Number first, then doubleValue to satisfy Rules DSL
 var double volts = 0.0
 if (voltsItem.state instanceof Number) { volts = (voltsItem.state as Number).doubleValue }
 
@@ -70,9 +69,16 @@ if (integTsItem.state instanceof DateTimeType) {
 // Update timestamp immediately for next loop
 integTsItem.postUpdate(new DateTimeType())
 
-// 3. Temperature Compensation
-// Cap adjustment: 1% per 3 deg C deviation from 25C
-val double tempFactor = 1.0 + ((temp - 25.0) * 0.006) 
+// 3. Temperature Compensation (FIXED for Fahrenheit)
+// If temp > 40.0, assume Fahrenheit and convert to Celsius.
+var double tempC = temp
+if (temp > 40.0) {
+    tempC = (temp - 32.0) * 5.0 / 9.0
+}
+
+// Lead acid capacity increases with heat, decreases with cold. Ref 25C.
+// Approx 1% change per 3 degrees C deviation from 25C.
+val double tempFactor = 1.0 + ((tempC - 25.0) * 0.006) 
 val double capacityNow = TOTAL_CAPACITY_AH * tempFactor
 
 // 4. Coulomb Counting
@@ -134,7 +140,6 @@ val double dischargeAhAvailable = remainingAh - targetFloorAh
 if (amps < -0.5 && dischargeAhAvailable > 0) {
     val double dischargeCurrent = Math.abs(amps)
     // Peukert Math: Time = Capacity / (I^k) 
-    // We apply the exponent to the current
     val double effectiveAmps = Math.pow(dischargeCurrent, PEUKERT_EXPONENT)
     
     val double hoursToEmptyTotal = (capacityNow / effectiveAmps)
