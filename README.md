@@ -1,70 +1,109 @@
-# Battery SoC, Runtime, and Time-to-Full (Fullriver DC400-6, 8S2P; Schneider MPPT 60-150)
+# Battery SoC, Runtime, and Time-to-Full Monitor
 
-OpenHAB 5.2+ Rules DSL script that computes SoC with voltage–coulomb fusion, temperature and Peukert corrections, smooth 99→100 % ramp, **runtime to 40 % SoC**, and **time-to-full (TTF)** while charging.
+**Hardware:** Fullriver DC400-6 (8S2P) | Schneider MPPT 60-150
+**Platform:** OpenHAB 5.2+ (Rules DSL)
 
-## Requirements
+This script implements a comprehensive Battery Management System (BMS) logic using **Voltage–Coulomb Fusion**. It provides accurate State of Charge (SoC), temperature/Peukert-compensated runtime, and a predictive Time-to-Full (TTF) based on available solar power and hardware limits.
 
-**Battery**
-- Fullriver DC400-6 AGM, 8S2P, **830 Ah @ C20**.
-- Float 54.6 V, Absorption 58.8 V.
+## Key Features
 
-**Charge controller**
-- Schneider **MPPT 60-150**. Output limited to **60 A**; DC-DC efficiency assumed **0.97**.
+*   **Hybrid SoC Calculation:** Combines Coulomb counting (Ah tracking) with voltage-based drift correction and a smooth 99% → 100% ramp during absorption/float.
+*   **Peukert-Compensated Runtime:** Calculates remaining runtime down to a safe **40% SoC** floor, adjusting for current discharge load and Peukert effect.
+*   **Smart Time-to-Full (TTF):** Estimates charging time by analyzing available PV power, clamping it to the Schneider MPPT limit (60A), and accounting for DC-DC conversion efficiency.
+*   **Auto-Scaling Inputs:** Automatically handles PV inputs in either standard units (V/A) or milli-units (mV/mA).
 
-## Items to create
+---
 
-Create these in **MainUI → Settings → Items → + Add Item**. Use the shown types. Enable *restoreOnStartup* on the helpers and outputs.
+## Hardware Profile
 
-| Item Name | Type | Purpose | Persist |
-|---|---|---|---|
-| `DCData_Voltage` | Number:ElectricPotential | Battery pack voltage (V) | — |
-| `DCData_Current` | Number:ElectricCurrent | Pack current (+A charge, −A discharge) | — |
-| `ChargerStatus` | String | “Bulk”, “Absorption”, “Float” | — |
-| `AmbientWeatherWS2902A_WH31E_193_Temperature` | Number:Temperature | Battery/ambient °C | — |
-| `BatterySoC_CoulombCounter` | Number | Raw coulomb-tracked SoC (%) | yes |
-| `BatterySoC_Calculated` | Number | Smoothed display SoC (%.2f) | yes |
-| `Battery_Voltage_EMA` | Number | EMA voltage | yes |
-| `Battery_Voltage_EMA_Ts` | DateTime | EMA timestamp | yes |
-| `Battery_TailOk_Since` | DateTime | Tail-current timer | yes |
-| `Battery_Remaining_Ah` | Number | Remaining Ah | yes |
-| `Battery_Runtime_Hours` | Number | Runtime to 40 % SoC (h) | yes |
-| `PV_Current` | Number or Number:ElectricCurrent | PV array current (A or mA) | — |
-| `PV_Power` | Number or Number:Power | PV power (W) | — |
-| `PV_Voltage` | Number or Number:ElectricPotential | PV voltage (V or mV) | — |
-| `Battery_TimeToFull_Hours` | Number | **Time to full** while charging (h) | yes |
+| Parameter | Value | Notes |
+| :--- | :--- | :--- |
+| **Battery Bank** | Fullriver DC400-6 AGM | 48V System (8S2P Topology) |
+| **Capacity** | **830 Ah** @ C20 | |
+| **Charging Profile** | Float: 54.6V | Absorption: 58.8V |
+| **Charge Controller** | Schneider MPPT 60-150 | **60A** Max Output Limit |
+| **Efficiency** | 97% (0.97) | Assumed DC-DC conversion loss |
 
-## State descriptions (UI formatting)
+---
 
-Add in **MainUI → Items → [item] → Add metadata → State description**.
+## Items Configuration
 
-- `BatterySoC_Calculated` → **Pattern:** `%.2f %%`
-- `Battery_Remaining_Ah` → **Pattern:** `%.1f Ah`
-- `Battery_Runtime_Hours` → **Pattern:** `%.2f h`
-- `Battery_TimeToFull_Hours` → **Pattern:** `%.2f h`
+Create the following items in **MainUI → Settings → Items**.
+*Ensure `restoreOnStartup` is enabled on all Output and Internal Helper items to prevent calculation resets on reboot.*
 
-> Suggested **state description** for `Battery_TimeToFull_Hours`:  
-> **Pattern:** `%.2f h`  
-> **Options:** leave empty  
-> **Read-only:** unchecked
+### 1. Input Sensors (Required)
+| Item Name | Type | Description |
+| :--- | :--- | :--- |
+| `DCData_Voltage` | `Number:ElectricPotential` | Main Battery Bank Voltage |
+| `DCData_Current` | `Number:ElectricCurrent` | Net Battery Current (+A charging, -A discharging) |
+| `ChargerStatus` | `String` | Charge Stage (e.g., "Bulk", "Absorption", "Float") |
+| `AmbientWeather..._Temperature` | `Number:Temperature` | Battery or Ambient Temperature |
 
-## Rule
+### 2. PV Inputs (Required for TTF)
+*Used to calculate potential charging power even if the battery is currently limiting current.*
+| Item Name | Type | Description |
+| :--- | :--- | :--- |
+| `PV_Current` | `Number:ElectricCurrent` | PV Array Input Current (A or mA) |
+| `PV_Voltage` | `Number:ElectricPotential` | PV Array Input Voltage (V or mV) |
+| `PV_Power` | `Number:Power` | (Optional) PV Input Power |
 
-Create a rule in **MainUI → Settings → Rules → + Add Rule**.
-- **Triggers:** “Item `DCData_Voltage` received update” OR “Item `DCData_Current` received update”.
-- **Action:** Script (Rules DSL). Paste the full script from `battery_soc_calc.rules`.
+### 3. Outputs & Helpers
+| Item Name | Type | Persistence | Description |
+| :--- | :--- | :--- | :--- |
+| `BatterySoC_Calculated` | `Number` | **YES** | Final Display SoC (%) |
+| `BatterySoC_CoulombCounter` | `Number` | **YES** | Raw tracked Ah percentage |
+| `Battery_Runtime_Hours` | `Number` | **YES** | Time remaining until 40% SoC |
+| `Battery_TimeToFull_Hours` | `Number` | **YES** | Estimated time to 100% SoC |
+| `Battery_Remaining_Ah` | `Number` | **YES** | Remaining capacity in Ah |
+| `Battery_Voltage_EMA` | `Number` | **YES** | Exponential Moving Average Voltage |
+| `Battery_Voltage_EMA_Ts` | `DateTime` | **YES** | Timestamp for EMA calculation |
+| `Battery_TailOk_Since` | `DateTime` | **YES** | Timer for tail-current detection |
 
-## Tuning knobs (inside script)
+---
 
-- `TOTAL_CAPACITY_AH = 830.0`
-- `PEUKERT_EXPONENT = 1.15`
-- `RUNTIME_DOD_LIMIT_PCT = 60.0`  → runtime stops at 40 % SoC
-- `TAIL_CURRENT_THRESH = C/100`
-- `EMA_ALPHA = 0.1`
-- `CONTROLLER_MAX_CHG_A = 60.0`, `CONTROLLER_EFF = 0.97`
-- Ramp rate near full: `rampRatePctPerMin = 0.2`
+## UI State Descriptions
 
-## Notes
+Add these metadata patterns in **MainUI** (Item → Add Metadata → State Description) to ensure correct formatting in your sitemap/widgets.
 
-- TTF is computed only when charging and reports `UNDEF` otherwise.
-- PV current/voltage may arrive in mA/mV; the script auto-scales.
-- Accuracy improves with valid charger status, temperature, and persistent EMA/tail items.
+*   **`BatterySoC_Calculated`**
+    *   Pattern: `%.2f %%`
+*   **`Battery_Remaining_Ah`**
+    *   Pattern: `%.1f Ah`
+*   **`Battery_Runtime_Hours`**
+    *   Pattern: `%.2f h`
+*   **`Battery_TimeToFull_Hours`**
+    *   Pattern: `%.2f h`
+    *   *Note: Returns `UNDEF` when not charging.*
+
+---
+
+## Installation
+
+1.  **Create Rule:** Go to **MainUI → Settings → Rules → + Add Rule**.
+2.  **Triggers:**
+    *   Item `DCData_Voltage` received update
+    *   *OR* Item `DCData_Current` received update
+3.  **Action:** Run Script (Rules DSL).
+4.  **Code:** Paste the contents of `battery_soc_calc.rules` into the script body.
+
+---
+
+## Logic & Tuning
+
+The following constants are defined at the top of the script. Modify them if your hardware changes.
+
+```java
+// Battery Physical Constants
+val Number TOTAL_CAPACITY_AH = 830.0   // @ C20
+val Number PEUKERT_EXPONENT  = 1.15    // AGM standard
+val Number TAIL_CURRENT_THRESH = 8.3   // ~1% of Capacity (C/100)
+
+// Calculations Limits
+val Number RUNTIME_DOD_LIMIT_PCT = 60.0 // 60% DoD = 40% SoC remaining
+
+// Hardware Limitations (Schneider MPPT 60-150)
+val Number CONTROLLER_MAX_CHG_A = 60.0 // Max amps controller can push to battery
+val Number CONTROLLER_EFF = 0.97       // Efficiency from PV High Voltage -> Battery Low Voltage
+
+// Smoothing
+val Number EMA_ALPHA = 0.1             // Voltage smoothing factor (0.1 = slow, 0.5 = fast)
