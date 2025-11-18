@@ -106,7 +106,8 @@ val Number CONTROLLER_MAX_CHG_A = 60.0 // Max amps controller can push to batter
 val Number CONTROLLER_EFF = 0.97       // Efficiency from PV High Voltage -> Battery Low Voltage
 
 // Smoothing
-val Number EMA_ALPHA = 0.1             // Voltage smoothing factor (0.1 = slow, 0.5 = fast)```
+val Number EMA_ALPHA = 0.1             // Voltage smoothing factor (0.1 = slow, 0.5 = fast)
+```
 
 ### How Time-to-Full (TTF) Works
 
