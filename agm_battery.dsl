@@ -1,227 +1,198 @@
-// ===============================
-// Fullriver DC400-6 (8S2P) AGM SoC + Runtime
-// OpenHAB 5.2+  |  Rules DSL | PRO GRADE
-// ===============================
+// ===================================================================================
+// CONFIGURATION CONSTANTS (Typed as 'double' to prevent math errors)
+// ===================================================================================
 
-// --- Battery Configuration ---
-val double TOTAL_CAPACITY_AH = 830.0
+// --- Battery Physics ---
+val double TOTAL_CAPACITY_AH    = 830.0   // Rated Capacity @ C20
+val double PEUKERT_EXPONENT     = 1.15    // Peukert's Constant
+val double TAIL_CURRENT_THRESH  = 8.3     // Amps
+val double CHARGED_VOLTAGE      = 54.6    // Float/Absorb voltage trigger
 
-// --- Voltage-SoC Points (OCV @ 25°C) ---
-val java.util.List<Double> V_POINTS = new java.util.ArrayList<Double>(java.util.Arrays.asList(
-    46.00, 47.04, 48.00, 49.04, 50.00, 51.04
-))
-val java.util.List<Double> SOC_POINTS = new java.util.ArrayList<Double>(java.util.Arrays.asList(
-    0.0, 20.0, 40.0, 60.0, 80.0, 100.0
-))
+// --- Logic Thresholds ---
+val double RUNTIME_DOD_LIMIT_PCT = 60.0   // 40% SoC is the floor for runtime calc
+val double EMA_ALPHA             = 0.1    // Smoothing factor
 
-// --- Physics Constants ---
-val double NOMINAL_TEMP_C        = 25.0
-val double TEMP_COEFF_OCV_PACK   = -0.096
-val double PEUKERT_EXPONENT      = 1.15
-val double C20_RATE              = TOTAL_CAPACITY_AH / 20.0
-val double CEF_NORMAL            = 0.98
-val double CEF_HIGH_SOC          = 0.92
-val double CEF_HIGH_SOC_THRESH   = 85.0
+// --- Solar/Hardware Limits ---
+val double CONTROLLER_MAX_CHG_A = 60.0    // Schneider MPPT Limit
+val double CONTROLLER_EFF       = 0.97    // Efficiency
 
-// --- Thresholds & Timers ---
-val double MAX_INTEGRATION_INTERVAL_SEC = 300.0  // Gap limit
-val double ZERO_CURRENT_THRESHOLD       = 0.3    // Amps. Treat anything less as 0.0 (Noise Filter)
-val double REST_CURRENT_THRESH          = 2.0    // Amps. Threshold for "Resting"
-val double TAIL_CURRENT_THRESH          = 6.5    // Amps. For Full detection
-val long   TAIL_PERSIST_MS              = 15L * 60L * 1000L
+// ===================================================================================
+// RULE LOGIC
+// ===================================================================================
 
-// --- Dynamic Settling Times ---
-// Surface charge takes longer to dissipate than voltage sag recovers
-val long   REST_TIME_AFTER_CHARGE_MS    = 60L * 60L * 1000L // 60 Mins
-val long   REST_TIME_AFTER_DISCHARGE_MS = 15L * 60L * 1000L // 15 Mins
+// Inputs
+val voltsItem    = DCData_Voltage
+val ampsItem     = DCData_Current
+val tempItem     = AmbientWeatherWS2902A_WH31E_193_Temperature
+val statusItem   = ChargerStatus
 
-// --- Slew Rate Limit ---
-val double MAX_SOC_JUMP_PER_RUN         = 1.0    // Max % change per execution to prevent jagged graphs
+// PV Inputs
+val pvVoltsItem  = PV_Voltage
+val pvAmpsItem   = PV_Current
 
-// --- Items ---
-val BATTERY_VOLTAGE_ITEM        = DCData_Voltage
-val BATTERY_CURRENT_ITEM        = DCData_Current
-val CHARGER_STATUS_ITEM         = ChargerStatus
-val BATTERY_TEMPERATURE_ITEM    = AmbientWeatherWS2902A_WH31E_193_Temperature
-val BATTERY_SOC_CALCULATED_ITEM = BatterySoC_Calculated
-val BATTERY_SOC_COULOMB_ITEM    = BatterySoC_CoulombCounter
-val V_EMA_ITEM                  = Battery_Voltage_EMA
-val V_EMA_TIME_ITEM             = Battery_Voltage_EMA_Ts
-val TAIL_OK_SINCE_ITEM          = Battery_TailOk_Since
-val LAST_ACTIVITY_ITEM          = Battery_LastActivityType // String: "CHARGE" or "DISCHARGE"
+// Outputs
+val socCalcItem  = BatterySoC_Calculated
+val socCCItem    = BatterySoC_CoulombCounter
+val emaVoltsItem = Battery_Voltage_EMA
+val emaTsItem    = Battery_Voltage_EMA_Ts
+val tailTimer    = Battery_TailOk_Since
+val remainAhItem = Battery_Remaining_Ah
+val runtimeItem  = Battery_Runtime_Hours
+val ttfItem      = Battery_TimeToFull_Hours
+val integTsItem  = Battery_Integration_TS 
 
-// --- Outputs ---
-val BATTERY_REMAINING_AH_ITEM   = Battery_Remaining_Ah
-val BATTERY_RUNTIME_HOURS_ITEM  = Battery_Runtime_Hours
-val BATTERY_TTF_HOURS_ITEM      = Battery_TimeToFull_Hours
+// 1. Get Valid Sensor Readings (Safety Check)
+// We explicitly cast to Number first, then doubleValue to satisfy Rules DSL
+var double volts = 0.0
+if (voltsItem.state instanceof Number) { volts = (voltsItem.state as Number).doubleValue }
 
-val String MAIN_LOG  = "SoC_Pro_Calc"
+var double amps = 0.0
+if (ampsItem.state instanceof Number) { amps = (ampsItem.state as Number).doubleValue }
 
-// ===============================
-// Execution
-// ===============================
+var double temp = 20.0
+if (tempItem.state instanceof Number) { temp = (tempItem.state as Number).doubleValue }
 
-if (BATTERY_VOLTAGE_ITEM.state == NULL || BATTERY_CURRENT_ITEM.state == NULL) return;
-val long nowMs = java.time.ZonedDateTime::now().toInstant().toEpochMilli()
+// 2. ROBUST INTEGRATOR TIMING
+var double dt = 0.0
+val long nowMillis = now.toInstant.toEpochMilli
 
-// 1. Fetch Inputs & Filter Noise
-var double vRaw = (BATTERY_VOLTAGE_ITEM.state as Number).doubleValue
-var double iRaw = (BATTERY_CURRENT_ITEM.state as Number).doubleValue
-
-// Noise Suppression (Ghost Current)
-if (java.lang.Math::abs(iRaw) <= ZERO_CURRENT_THRESHOLD) iRaw = 0.0
-
-var double tempC = NOMINAL_TEMP_C
-if (BATTERY_TEMPERATURE_ITEM.state instanceof QuantityType) {
-    tempC = (BATTERY_TEMPERATURE_ITEM.state as QuantityType<Number>).toUnit("°C").doubleValue
-}
-
-// 2. Track Activity Type (for dynamic rest times)
-// If we are moving significantly, record what we are doing
-if (iRaw > REST_CURRENT_THRESH) postUpdate(LAST_ACTIVITY_ITEM, "CHARGE")
-else if (iRaw < -REST_CURRENT_THRESH) postUpdate(LAST_ACTIVITY_ITEM, "DISCHARGE")
-
-// 3. Temperature Compensated OCV & EMA
-val double vCompensated = vRaw - (tempC - NOMINAL_TEMP_C) * TEMP_COEFF_OCV_PACK
-val double EMA_ALPHA = 0.05
-var double vEma  = if (V_EMA_ITEM.state instanceof Number) (V_EMA_ITEM.state as Number).doubleValue else vCompensated
-val double vEmaNew = (1.0 - EMA_ALPHA) * vEma + EMA_ALPHA * vCompensated
-postUpdate(V_EMA_ITEM, vEmaNew)
-
-// 4. Smart Rest Detection
-val boolean isResting = java.lang.Math::abs(iRaw) < REST_CURRENT_THRESH
-var long stableSince = nowMs
-if (V_EMA_TIME_ITEM.state instanceof DateTimeType) {
-    stableSince = (V_EMA_TIME_ITEM.state as DateTimeType).zonedDateTime.toInstant().toEpochMilli()
-}
-
-// Reset timer if not resting OR voltage is jumping
-if (!isResting || java.lang.Math::abs(vEmaNew - vEma) > 0.05) {
-    postUpdate(V_EMA_TIME_ITEM, new DateTimeType(java.time.ZonedDateTime::now()))
-    stableSince = nowMs
-}
-
-// Determine required wait time based on previous activity
-var long requiredWait = REST_TIME_AFTER_DISCHARGE_MS // default short
-if (LAST_ACTIVITY_ITEM.state.toString == "CHARGE") {
-    requiredWait = REST_TIME_AFTER_CHARGE_MS
-}
-
-val boolean ocvValid = isResting && ((nowMs - stableSince) >= requiredWait)
-
-// 5. Calculate Voltage-Lookup SoC
-var double voltageSoC = -1.0
-if (ocvValid) {
-    if (vEmaNew <= V_POINTS.get(0)) voltageSoC = 0.0
-    else if (vEmaNew >= V_POINTS.get(V_POINTS.size() - 1)) voltageSoC = 100.0
-    else {
-        for (var i = 0; i < V_POINTS.size() - 1; i++) {
-            if (vEmaNew >= V_POINTS.get(i) && vEmaNew < V_POINTS.get(i+1)) {
-                val double v1 = V_POINTS.get(i); val double v2 = V_POINTS.get(i+1)
-                val double s1 = SOC_POINTS.get(i); val double s2 = SOC_POINTS.get(i+1)
-                voltageSoC = s1 + (vEmaNew - v1) / (v2 - v1) * (s2 - s1)
-            }
-        }
-    }
-}
-
-// 6. Coulomb Counting
-var double currentSoC = 50.0
-if (BATTERY_SOC_COULOMB_ITEM.state instanceof Number) {
-    val double prev = (BATTERY_SOC_COULOMB_ITEM.state as Number).doubleValue
-    if (prev >= 0 && prev <= 100) currentSoC = prev
-}
-
-if (BATTERY_SOC_COULOMB_ITEM.lastUpdate !== null) {
-    val long lastUpdateMs = BATTERY_SOC_COULOMB_ITEM.lastUpdate.toInstant().toEpochMilli()
-    val double dt = (nowMs - lastUpdateMs) / 1000.0
-
-    if (dt > 0 && dt <= MAX_INTEGRATION_INTERVAL_SEC) {
-        var double iEffective = iRaw
-        if (iRaw > 0) {
-            val double cef = if (currentSoC > CEF_HIGH_SOC_THRESH) CEF_HIGH_SOC else CEF_NORMAL
-            iEffective = iRaw * cef
-        } else if (iRaw < 0) {
-            val double ratio = java.lang.Math::min((java.lang.Math::abs(iRaw) / C20_RATE), 5.0)
-            if (ratio > 1.0) iEffective = iRaw * java.lang.Math.pow(ratio, PEUKERT_EXPONENT - 1.0)
-        }
-
-        // Only integrate if Current is not 0 (Optimization)
-        if (iRaw != 0.0) {
-            val double ahDelta = (iEffective * dt) / 3600.0
-            val double socDelta = (ahDelta / TOTAL_CAPACITY_AH) * 100.0
-            currentSoC = currentSoC + socDelta
-        }
-    } else if (dt > MAX_INTEGRATION_INTERVAL_SEC) {
-        // GAP RECOVERY
-        logWarn(MAIN_LOG, "Gap Detected ({}s).", dt)
-        if (ocvValid && voltageSoC >= 0) {
-            // We trust voltage completely after a gap if resting
-            currentSoC = voltageSoC
-            logInfo(MAIN_LOG, "Gap Recovery: Snapped to Voltage SoC {}%", voltageSoC)
-        }
-    }
-}
-
-// 7. Drift Correction with Slew Rate Limit
-var double targetSoC = currentSoC
-if (ocvValid && voltageSoC >= 0) {
-    val double diff = java.lang.Math::abs(currentSoC - voltageSoC)
-    // Only correct if diff is relevant (>3%) to avoid micro-jitter
-    if (diff > 3.0) {
-         // Move 10% of the way towards the voltage target
-         targetSoC = currentSoC + (voltageSoC - currentSoC) * 0.1
-         logInfo(MAIN_LOG, "Drift Correction: Coulomb {}% -> Target {}% (via VSoC {}%)", 
-             String::format("%.2f", currentSoC), String::format("%.2f", targetSoC), String::format("%.2f", voltageSoC))
-    }
-}
-
-// 8. True Full Reset
-val boolean isAbsorb = vRaw > 58.0 || "Absorption".equals(CHARGER_STATUS_ITEM.state.toString) || "Float".equals(CHARGER_STATUS_ITEM.state.toString)
-if (isAbsorb && iRaw < TAIL_CURRENT_THRESH && iRaw > 0) {
-    var long tailSince = nowMs
-    if (TAIL_OK_SINCE_ITEM.state instanceof DateTimeType) {
-        tailSince = (TAIL_OK_SINCE_ITEM.state as DateTimeType).zonedDateTime.toInstant().toEpochMilli()
+if (integTsItem.state instanceof DateTimeType) {
+    val long lastMillis = (integTsItem.state as DateTimeType).zonedDateTime.toInstant.toEpochMilli
+    val long diffMillis = nowMillis - lastMillis
+    
+    // Sanity: Only integrate if gap is < 10 mins (600,000ms) to avoid ghost data after reboot
+    if (diffMillis > 0 && diffMillis < 600000) {
+        dt = diffMillis / 3600000.0 // Convert ms to Hours
     } else {
-        postUpdate(TAIL_OK_SINCE_ITEM, new DateTimeType(java.time.ZonedDateTime::now()))
+        logInfo("Battery", "Integrator Sync: Gap detected or first run. Skipping one cycle.")
     }
-    if ((nowMs - tailSince) > TAIL_PERSIST_MS) {
-        targetSoC = 100.0 // Force Full
+}
+// Update timestamp immediately for next loop
+integTsItem.postUpdate(new DateTimeType())
+
+// 3. Temperature Compensation
+// Cap adjustment: 1% per 3 deg C deviation from 25C
+val double tempFactor = 1.0 + ((temp - 25.0) * 0.006) 
+val double capacityNow = TOTAL_CAPACITY_AH * tempFactor
+
+// 4. Coulomb Counting
+var double currentSoCCoulomb = 50.0 // Default if null
+if (socCCItem.state instanceof Number) {
+    currentSoCCoulomb = (socCCItem.state as Number).doubleValue
+}
+
+if (dt > 0) {
+    val double ahChange = amps * dt
+    val double pctChange = (ahChange / capacityNow) * 100.0
+    currentSoCCoulomb = currentSoCCoulomb + pctChange
+}
+
+// 5. Full Detection & Tail Current Logic
+var boolean isTailCondition = (volts > CHARGED_VOLTAGE && amps > 0 && amps < TAIL_CURRENT_THRESH)
+
+if (isTailCondition) {
+    if (tailTimer.state === NULL || tailTimer.state === UNDEF) {
+        tailTimer.postUpdate(new DateTimeType()) // Start timer
+    } else {
+        // Check how long we've been in tail state
+        val long tailStart = (tailTimer.state as DateTimeType).zonedDateTime.toInstant.toEpochMilli
+        if ((nowMillis - tailStart) > 180000) { // 3 minutes
+             currentSoCCoulomb = 100.0
+        }
     }
 } else {
-    postUpdate(TAIL_OK_SINCE_ITEM, new DateTimeType(java.time.ZonedDateTime::now()))
+    if (tailTimer.state !== NULL && tailTimer.state !== UNDEF) {
+        tailTimer.postUpdate(UNDEF) 
+    }
 }
 
-// 9. Apply Slew Rate Limiting (The "Anti-Jump" Logic)
-// We calculated a 'targetSoC', but we restrict how fast we can get there
-var double finalSoC = currentSoC
-val double change = targetSoC - currentSoC
+// Clamp Limits
+if (currentSoCCoulomb > 100.0) currentSoCCoulomb = 100.0
+if (currentSoCCoulomb < 0.0)   currentSoCCoulomb = 0.0
+socCCItem.postUpdate(currentSoCCoulomb)
 
-if (java.lang.Math::abs(change) > MAX_SOC_JUMP_PER_RUN) {
-    if (change > 0) finalSoC = currentSoC + MAX_SOC_JUMP_PER_RUN
-    else finalSoC = currentSoC - MAX_SOC_JUMP_PER_RUN
+// 6. Hybrid SoC (Smooth Ramp)
+var double finalSoC = currentSoCCoulomb
+
+// If voltage is high or Float, pull SoC up gently if it's lagging
+if (statusItem.state.toString == "Float" || (volts > CHARGED_VOLTAGE)) {
+    if (finalSoC < 95.0) { 
+         finalSoC = finalSoC + 0.05 
+    }
+}
+socCalcItem.postUpdate(finalSoC)
+
+// 7. Remaining Ah
+val double remainingAh = (finalSoC / 100.0) * capacityNow
+remainAhItem.postUpdate(remainingAh)
+
+// 8. Peukert-Corrected Runtime
+var double runtimeHours = 0.0
+val double targetFloorAh = capacityNow * (RUNTIME_DOD_LIMIT_PCT / 100.0)
+val double dischargeAhAvailable = remainingAh - targetFloorAh
+
+if (amps < -0.5 && dischargeAhAvailable > 0) {
+    val double dischargeCurrent = Math.abs(amps)
+    // Peukert Math: Time = Capacity / (I^k) 
+    // We apply the exponent to the current
+    val double effectiveAmps = Math.pow(dischargeCurrent, PEUKERT_EXPONENT)
+    
+    val double hoursToEmptyTotal = (capacityNow / effectiveAmps)
+    
+    // Scale total hours by the % of useful battery remaining
+    val double pctAvailable = (finalSoC - (100.0 - RUNTIME_DOD_LIMIT_PCT)) / 100.0
+    
+    if (pctAvailable > 0) {
+        runtimeHours = hoursToEmptyTotal * pctAvailable
+    }
+}
+runtimeItem.postUpdate(runtimeHours)
+
+// 9. Time-To-Full (TTF)
+var double ttfHours = 0.0
+
+if (amps > 0.5) {
+    // Get PV Data safely
+    var double pvV = 0.0
+    if (pvVoltsItem.state instanceof Number) pvV = (pvVoltsItem.state as Number).doubleValue
+    
+    var double pvA = 0.0
+    if (pvAmpsItem.state instanceof Number) pvA = (pvAmpsItem.state as Number).doubleValue
+    
+    // Auto-scale milli-units
+    if (pvV > 10000) pvV = pvV / 1000.0
+    if (pvA > 10000) pvA = pvA / 1000.0
+    
+    val double pvWatts = pvV * pvA * CONTROLLER_EFF
+    
+    // Calculate Potential Charging Amps
+    var double potentialAmps = 0.0
+    if (volts > 10) {
+        potentialAmps = pvWatts / volts
+    }
+    
+    // Clamp to Hardware Limit
+    if (potentialAmps > CONTROLLER_MAX_CHG_A) potentialAmps = CONTROLLER_MAX_CHG_A
+    
+    if (potentialAmps > 0.5) {
+        val double ahNeeded = capacityNow - remainingAh
+        ttfHours = ahNeeded / potentialAmps
+    }
+    
+    // If already near full, show 0
+    if (finalSoC >= 99.0) ttfHours = 0.0
+    
+    ttfItem.postUpdate(ttfHours)
 } else {
-    finalSoC = targetSoC
+    ttfItem.postUpdate(UNDEF)
 }
 
-// 10. Final Bounds & Update
-finalSoC = java.lang.Math::min(100.0, java.lang.Math::max(0.0, finalSoC))
-postUpdate(BATTERY_SOC_COULOMB_ITEM, finalSoC)
-postUpdate(BATTERY_SOC_CALCULATED_ITEM, String::format("%.1f", finalSoC))
-
-// 11. Runtime Estimates
-if (iRaw < -1.0) {
-    val double remainingAh = (finalSoC / 100.0) * TOTAL_CAPACITY_AH
-    val double hours = remainingAh / java.lang.Math::abs(iRaw)
-    postUpdate(BATTERY_REMAINING_AH_ITEM, remainingAh)
-    postUpdate(BATTERY_RUNTIME_HOURS_ITEM, hours)
-    postUpdate(BATTERY_TTF_HOURS_ITEM, UNDEF)
-} else if (iRaw > 1.0 && finalSoC < 99.0) {
-    val double ahNeeded = ((100.0 - finalSoC) / 100.0) * TOTAL_CAPACITY_AH
-    val double hours = ahNeeded / (iRaw * CEF_NORMAL)
-    postUpdate(BATTERY_TTF_HOURS_ITEM, hours)
-    postUpdate(BATTERY_RUNTIME_HOURS_ITEM, UNDEF)
-} else {
-    postUpdate(BATTERY_TTF_HOURS_ITEM, UNDEF)
-    postUpdate(BATTERY_RUNTIME_HOURS_ITEM, UNDEF)
+// 10. Voltage EMA (Smoothing)
+var double oldEma = volts
+if (emaVoltsItem.state instanceof Number) {
+    oldEma = (emaVoltsItem.state as Number).doubleValue
 }
+var double newEma = (EMA_ALPHA * volts) + ((1.0 - EMA_ALPHA) * oldEma)
+
+emaVoltsItem.postUpdate(newEma)
+emaTsItem.postUpdate(new DateTimeType())
