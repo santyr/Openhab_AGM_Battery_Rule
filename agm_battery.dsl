@@ -1,9 +1,17 @@
 // ===================================================================================
-// BATTERY STATE-OF-CHARGE RULE v2.0
+// BATTERY STATE-OF-CHARGE RULE v2.1
 // ===================================================================================
 // System: 48V AGM Bank (8S2P Fullriver DC400-6)
 // Capacity: 830Ah @ C20 (2 × 415Ah parallel strings)
 // 
+// Changelog v2.1:
+//   - Added charging efficiency factor (95% → 85% as SoC increases)
+//   - Added current sensor zero-offset correction with dead-band
+//   - Added OCV-based calibration during rest periods (30+ min)
+//   - Added self-discharge modeling (~3%/month per datasheet)
+//   - Improved cold-start initialization using voltage estimate
+//   - Added new item: Battery_Rest_Since (DateTime)
+//
 // Changelog v2.0:
 //   - Fixed CHARGED_VOLTAGE threshold (53.5V → 54.2V per datasheet)
 //   - Corrected Peukert runtime calculation (was double-scaling)
@@ -42,6 +50,28 @@ val MAX_INTEGRATION_GAP   = 600000  // 10 min max gap before skipping integratio
 val CONTROLLER_MAX_CHG_A  = 60.0    // Max charge current
 val CONTROLLER_EFF        = 0.97    // MPPT efficiency factor
 
+// --- v2.1: Current Sensor Calibration ---
+// CALIBRATE THIS: With no loads and no charging, observe the current reading.
+// Enter that value here to correct for sensor offset. Positive = sensor reads high.
+val CURRENT_ZERO_OFFSET   = 0.0     // Amps (measure when system at rest, adjust if non-zero)
+val CURRENT_DEAD_BAND     = 0.3     // Ignore currents smaller than this (noise floor)
+
+// --- v2.1: Charging Efficiency ---
+// AGM batteries don't accept charge at 100% efficiency. 
+// Efficiency decreases as SoC increases (more energy lost as heat).
+val CHARGE_EFF_LOW_SOC    = 0.95    // 95% efficient when battery is depleted
+val CHARGE_EFF_HIGH_SOC   = 0.85    // 85% efficient when nearly full
+val CHARGE_EFF_KNEE_SOC   = 80.0    // SoC% where efficiency starts dropping faster
+
+// --- v2.1: Self-Discharge ---
+// Per datasheet: ~3% per month at 77°F (25°C), faster when hot
+val SELF_DISCHARGE_PCT_DAY_25C = 0.10   // 0.1%/day at 25°C (~3%/month)
+
+// --- v2.1: OCV Calibration ---
+val OCV_REST_TIME_MS      = 1800000 // 30 minutes of rest before OCV is reliable
+val OCV_REST_CURRENT_THRESH = 1.0   // Current must be below this to count as "resting"
+val OCV_BLEND_WEIGHT      = 0.3     // How much to trust OCV vs coulomb counter (0.3 = 30% OCV)
+
 // ===================================================================================
 // ITEM REFERENCES
 // ===================================================================================
@@ -65,14 +95,36 @@ val tailTimer    = Battery_TailOk_Since
 val remainAhItem = Battery_Remaining_Ah
 val runtimeItem  = Battery_Runtime_Hours
 val ttfItem      = Battery_TimeToFull_Hours
-val integTsItem  = Battery_Integration_TS 
+val integTsItem  = Battery_Integration_TS
+
+// v2.1: New item for OCV rest detection
+val restTimer    = Battery_Rest_Since   // DateTime item - ADD TO YOUR .items FILE
+
+// ===================================================================================
+// HELPER FUNCTION: OCV to SoC Lookup
+// ===================================================================================
+// Based on DC400-6 datasheet "State of Charge vs Open Circuit Voltage" curve
+// Scaled for 48V bank (8 × 6V cells in series)
+// 
+// Datasheet 6V values → 48V values:
+//   6.50V = 100% → 52.0V (but this is right after charge, not true OCV)
+//   6.38V = ~90% → 51.04V  
+//   6.25V = ~75% → 50.0V
+//   6.13V = ~55% → 49.04V
+//   6.00V = ~35% → 48.0V
+//   5.88V = ~15% → 47.04V
+//   5.75V = ~0%  → 46.0V
+//
+// Note: True OCV requires 30+ minutes of rest. Values during charge/discharge
+// will be higher/lower due to internal resistance.
+// ===================================================================================
 
 // ===================================================================================
 // MAIN RULE LOGIC
 // ===================================================================================
 
 // ---------------------------------------------------------------------------------
-// 1. SAFE SENSOR READINGS
+// 1. SAFE SENSOR READINGS (with offset correction)
 // ---------------------------------------------------------------------------------
 var volts = 0.0
 if (voltsItem.state instanceof Number) { 
@@ -82,6 +134,14 @@ if (voltsItem.state instanceof Number) {
 var amps = 0.0
 if (ampsItem.state instanceof Number) { 
     amps = (ampsItem.state as Number).doubleValue 
+    
+    // v2.1: Apply zero-offset correction
+    amps = amps - CURRENT_ZERO_OFFSET
+    
+    // v2.1: Dead-band to eliminate noise accumulation
+    if (Math.abs(amps) < CURRENT_DEAD_BAND) {
+        amps = 0.0
+    }
 }
 
 var temp = 20.0
@@ -153,23 +213,160 @@ emaVoltsItem.postUpdate(newEma)
 emaTsItem.postUpdate(new DateTimeType())
 
 // ---------------------------------------------------------------------------------
-// 5. COULOMB COUNTING (Core Integration)
+// 5. COULOMB COUNTING (with efficiency and self-discharge)
 // ---------------------------------------------------------------------------------
-var currentSoCCoulomb = 50.0  // Default mid-range if uninitialized
+
+// v2.1: Improved cold-start initialization
+var currentSoCCoulomb = 50.0
+var boolean coldStart = false
+
 if (socCCItem.state instanceof Number) {
     currentSoCCoulomb = (socCCItem.state as Number).doubleValue
+} else {
+    // Cold start - estimate from OCV (assumes some rest, but better than 50%)
+    coldStart = true
+    if (volts > 53.0) {
+        currentSoCCoulomb = 90.0
+    } else if (volts > 52.0) {
+        currentSoCCoulomb = 80.0
+    } else if (volts > 51.0) {
+        currentSoCCoulomb = 65.0
+    } else if (volts > 50.0) {
+        currentSoCCoulomb = 50.0
+    } else if (volts > 49.0) {
+        currentSoCCoulomb = 35.0
+    } else if (volts > 48.0) {
+        currentSoCCoulomb = 25.0
+    } else if (volts > 47.0) {
+        currentSoCCoulomb = 15.0
+    } else {
+        currentSoCCoulomb = 5.0
+    }
+    logWarn("Battery", "Cold start detected. Initializing SoC to " + currentSoCCoulomb + "% based on voltage " + volts + "V")
 }
 
-if (dt > 0) {
-    // Integrate: Ah = A × hours
-    // Positive amps = charging, Negative amps = discharging
-    val ahChange = amps * dt
+if (dt > 0 && !coldStart) {
+    // Calculate Ah change
+    var ahChange = amps * dt
+    
+    // v2.1: Apply charging efficiency factor
+    if (amps > 0) {
+        // Charging - efficiency decreases as SoC increases
+        // Linear interpolation: 95% at 0% SoC → 85% at 100% SoC
+        // With faster dropoff above the knee point
+        var chargeEfficiency = CHARGE_EFF_LOW_SOC
+        
+        if (currentSoCCoulomb > CHARGE_EFF_KNEE_SOC) {
+            // Above knee: steeper efficiency drop
+            val socAboveKnee = currentSoCCoulomb - CHARGE_EFF_KNEE_SOC
+            val rangeAboveKnee = 100.0 - CHARGE_EFF_KNEE_SOC
+            val effDrop = (CHARGE_EFF_LOW_SOC - CHARGE_EFF_HIGH_SOC) * (socAboveKnee / rangeAboveKnee)
+            chargeEfficiency = CHARGE_EFF_LOW_SOC - effDrop
+        } else {
+            // Below knee: gradual efficiency drop
+            val effDropBelowKnee = (CHARGE_EFF_LOW_SOC - CHARGE_EFF_HIGH_SOC) * 0.3  // 30% of total drop below knee
+            chargeEfficiency = CHARGE_EFF_LOW_SOC - (effDropBelowKnee * (currentSoCCoulomb / CHARGE_EFF_KNEE_SOC))
+        }
+        
+        ahChange = ahChange * chargeEfficiency
+        
+        logDebug("Battery", "Charge efficiency at " + String.format("%.1f", currentSoCCoulomb) + "% SoC: " + String.format("%.1f", chargeEfficiency * 100) + "%")
+    }
+    
+    // v2.1: Apply self-discharge when idle
+    if (Math.abs(amps) < 0.5) {
+        // Not charging or discharging significantly - apply self-discharge
+        // Self-discharge increases with temperature (roughly doubles per 10°C)
+        val tempMultiplier = Math.pow(2.0, (tempC - 25.0) / 10.0)
+        val selfDischargePctPerHour = (SELF_DISCHARGE_PCT_DAY_25C / 24.0) * tempMultiplier
+        val selfDischargeThisCycle = selfDischargePctPerHour * dt
+        
+        currentSoCCoulomb = currentSoCCoulomb - selfDischargeThisCycle
+        
+        // Only log occasionally (when > 0.01% discharged)
+        if (selfDischargeThisCycle > 0.01) {
+            logDebug("Battery", "Self-discharge: " + String.format("%.3f", selfDischargeThisCycle) + "% (temp multiplier: " + String.format("%.2f", tempMultiplier) + ")")
+        }
+    }
+    
+    // Apply Ah change to SoC
     val pctChange = (ahChange / capacityNow) * 100.0
     currentSoCCoulomb = currentSoCCoulomb + pctChange
 }
 
 // ---------------------------------------------------------------------------------
-// 6. FULL CHARGE DETECTION (Multi-condition with stability)
+// 6. OCV-BASED CALIBRATION (during extended rest)
+// ---------------------------------------------------------------------------------
+val boolean isResting = (Math.abs(amps) < OCV_REST_CURRENT_THRESH)
+
+if (isResting) {
+    if (restTimer.state === NULL || restTimer.state === UNDEF) {
+        // Start rest timer
+        restTimer.postUpdate(new DateTimeType())
+        logDebug("Battery", "Rest period started. Current: " + amps + "A")
+    } else {
+        // Check how long we've been resting
+        val restStart = (restTimer.state as DateTimeType).zonedDateTime.toInstant.toEpochMilli
+        val restDuration = nowMillis - restStart
+        
+        if (restDuration > OCV_REST_TIME_MS) {
+            // Battery has rested long enough - OCV is now reliable
+            // Calculate SoC from OCV using datasheet curve (48V bank)
+            var ocvSoC = 0.0
+            
+            // Piecewise linear interpolation based on DC400-6 datasheet
+            // 48V bank OCV values (8 cells × 6V nominal)
+            if (volts >= 52.0) {
+                // 52.0V = 100%, but cap since true 100% is hard to measure via OCV
+                ocvSoC = 95.0 + ((volts - 52.0) / 2.0) * 5.0
+                if (ocvSoC > 100.0) ocvSoC = 100.0
+            } else if (volts >= 51.0) {
+                // 51.0V ≈ 85%, 52.0V ≈ 95%
+                ocvSoC = 85.0 + ((volts - 51.0) / 1.0) * 10.0
+            } else if (volts >= 50.0) {
+                // 50.0V ≈ 70%, 51.0V ≈ 85%
+                ocvSoC = 70.0 + ((volts - 50.0) / 1.0) * 15.0
+            } else if (volts >= 49.0) {
+                // 49.0V ≈ 50%, 50.0V ≈ 70%
+                ocvSoC = 50.0 + ((volts - 49.0) / 1.0) * 20.0
+            } else if (volts >= 48.0) {
+                // 48.0V ≈ 30%, 49.0V ≈ 50%
+                ocvSoC = 30.0 + ((volts - 48.0) / 1.0) * 20.0
+            } else if (volts >= 47.0) {
+                // 47.0V ≈ 15%, 48.0V ≈ 30%
+                ocvSoC = 15.0 + ((volts - 47.0) / 1.0) * 15.0
+            } else if (volts >= 46.0) {
+                // 46.0V ≈ 5%, 47.0V ≈ 15%
+                ocvSoC = 5.0 + ((volts - 46.0) / 1.0) * 10.0
+            } else {
+                // Below 46.0V - nearly empty
+                ocvSoC = Math.max(0.0, (volts - 44.0) / 2.0 * 5.0)
+            }
+            
+            // Check if OCV estimate differs significantly from coulomb counter
+            val ocvDiff = Math.abs(ocvSoC - currentSoCCoulomb)
+            
+            if (ocvDiff > 5.0) {
+                // Significant difference - blend toward OCV estimate
+                val oldSoC = currentSoCCoulomb
+                currentSoCCoulomb = (ocvSoC * OCV_BLEND_WEIGHT) + (currentSoCCoulomb * (1.0 - OCV_BLEND_WEIGHT))
+                
+                logInfo("Battery", "OCV calibration after " + (restDuration / 60000) + " min rest: V=" + 
+                    String.format("%.2f", volts) + "V → OCV suggests " + String.format("%.1f", ocvSoC) + 
+                    "% (was " + String.format("%.1f", oldSoC) + "%, adjusted to " + 
+                    String.format("%.1f", currentSoCCoulomb) + "%)")
+            }
+        }
+    }
+} else {
+    // Not resting - clear rest timer
+    if (restTimer.state !== NULL && restTimer.state !== UNDEF) {
+        restTimer.postUpdate(UNDEF)
+    }
+}
+
+// ---------------------------------------------------------------------------------
+// 7. FULL CHARGE DETECTION (Multi-condition with stability)
 // ---------------------------------------------------------------------------------
 val boolean voltageStable = Math.abs(volts - newEma) < VOLTAGE_STABLE_BAND
 val boolean voltageAboveThreshold = (volts > CHARGED_VOLTAGE)
@@ -194,7 +391,8 @@ if (shouldTriggerFull) {
         if (tailDuration > FULL_DETECT_TIME_MS) {
             // Confirmed full - reset coulomb counter
             if (currentSoCCoulomb < 99.0) {
-                logInfo("Battery", "Full charge detected after " + (tailDuration/1000) + "s. Resetting SoC to 100%")
+                logInfo("Battery", "Full charge detected after " + (tailDuration/1000) + "s. Resetting SoC from " + 
+                    String.format("%.1f", currentSoCCoulomb) + "% to 100%")
             }
             currentSoCCoulomb = 100.0
         }
@@ -207,7 +405,7 @@ if (shouldTriggerFull) {
 }
 
 // ---------------------------------------------------------------------------------
-// 7. SOC BOUNDS & DRIFT CORRECTION
+// 8. SOC BOUNDS & DRIFT CORRECTION
 // ---------------------------------------------------------------------------------
 
 // Hard clamp to valid range
@@ -217,20 +415,22 @@ if (currentSoCCoulomb < 0.0) currentSoCCoulomb = 0.0
 // Voltage-based sanity bounds (catch major drift)
 // If voltage drops below cutoff, SoC cannot be above 10%
 if (volts < MIN_VOLTAGE_CUTOFF && currentSoCCoulomb > 10.0) {
-    logWarn("Battery", "Voltage (" + volts + "V) indicates near-empty. Capping SoC at 10%")
+    logWarn("Battery", "Voltage (" + volts + "V) indicates near-empty. Capping SoC from " + 
+        String.format("%.1f", currentSoCCoulomb) + "% to 10%")
     currentSoCCoulomb = 10.0
 }
 
 // If voltage is at/above absorption and stable, SoC must be at least 80%
 if (volts >= ABSORPTION_VOLTAGE && voltageStable && currentSoCCoulomb < 80.0) {
-    logInfo("Battery", "Voltage at absorption (" + volts + "V) but SoC low. Adjusting to 80%")
+    logInfo("Battery", "Voltage at absorption (" + volts + "V) but SoC low. Adjusting from " + 
+        String.format("%.1f", currentSoCCoulomb) + "% to 80%")
     currentSoCCoulomb = 80.0
 }
 
 socCCItem.postUpdate(currentSoCCoulomb)
 
 // ---------------------------------------------------------------------------------
-// 8. HYBRID SOC (Time-based convergence to 100% during float)
+// 9. HYBRID SOC (Time-based convergence to 100% during float)
 // ---------------------------------------------------------------------------------
 var finalSoC = currentSoCCoulomb
 
@@ -247,13 +447,13 @@ if (isFloatStatus || (voltageAboveThreshold && voltageStable && amps > 0 && amps
 socCalcItem.postUpdate(finalSoC)
 
 // ---------------------------------------------------------------------------------
-// 9. REMAINING CAPACITY (Ah)
+// 10. REMAINING CAPACITY (Ah)
 // ---------------------------------------------------------------------------------
 val remainingAh = (finalSoC / 100.0) * capacityNow
 remainAhItem.postUpdate(remainingAh)
 
 // ---------------------------------------------------------------------------------
-// 10. PEUKERT-CORRECTED RUNTIME (Fixed Formula)
+// 11. PEUKERT-CORRECTED RUNTIME (Fixed Formula)
 // ---------------------------------------------------------------------------------
 var runtimeHours = 0.0
 
@@ -286,7 +486,7 @@ if (amps < -0.5 && usableAh > 0) {
 runtimeItem.postUpdate(runtimeHours)
 
 // ---------------------------------------------------------------------------------
-// 11. TIME-TO-FULL WITH CHARGE PHASE MODELING
+// 12. TIME-TO-FULL WITH CHARGE PHASE MODELING
 // ---------------------------------------------------------------------------------
 var ttfHours = 0.0
 
@@ -367,7 +567,7 @@ if (amps > 0.5) {
 }
 
 // ---------------------------------------------------------------------------------
-// 12. LOGGING (Debug - comment out for production)
+// 13. LOGGING
 // ---------------------------------------------------------------------------------
 if (dt > 0) {
     logDebug("Battery", String.format(
